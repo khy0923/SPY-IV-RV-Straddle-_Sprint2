@@ -142,3 +142,43 @@ def expiry_variance(otm: pd.DataFrame, F: float, K0: float, r: float, T: float) 
 
     total = np.sum(dK / K**2 * np.exp(r * T) * Q)
     return (2 / T) * total - (1 / T) * (F / K0 - 1) ** 2
+def interpolate_variance(v1, T1, v2, T2, T_target):
+    """두 만기의 분산을 목표 기간으로 보간(또는 외삽)한다. 누적 분산 w = σ²·T를 직선으로 잇는다."""
+    w1, w2 = v1 * T1, v2 * T2
+    w = w1 + (w2 - w1) * (T_target - T1) / (T2 - T1)
+    return w / T_target if w > 0 else float("nan")   # 외삽으로 음수가 나오면 무효 처리
+
+
+def compute_mfiv(df: pd.DataFrame, rates: pd.Series,
+                 target_days: int = 30, min_days: int = 7) -> pd.DataFrame:
+    """전체 날짜에 대해 30일 MFIV 시계열을 계산한다."""
+    exps = select_expiries(df, target_days, min_days)
+    r_daily = rates.reindex(exps["quote_date"], method="ffill").to_numpy()
+    groups = df.groupby(["quote_date", "expire_date"])
+
+    out = []
+    for (_, row), r in zip(exps.iterrows(), r_daily):
+        var = []
+        for exp, dte in [(row["near_exp"], row["near_dte"]), (row["next_exp"], row["next_dte"])]:
+            chain = groups.get_group((row["quote_date"], exp))
+            T = dte / 365
+            F, K0 = compute_forward(chain, r, T)
+            var.append(expiry_variance(select_otm(chain, K0), F, K0, r, T) if np.isfinite(K0) else np.nan)
+
+        v30 = interpolate_variance(var[0], row["near_dte"] / 365, var[1], row["next_dte"] / 365,
+                                   target_days / 365)
+        out.append({"date": row["quote_date"], "mfiv_var": v30, "mfiv_vol": np.sqrt(v30),
+                    "near_var": var[0], "next_var": var[1], "extrapolated": row["extrapolated"]})
+    return pd.DataFrame(out).set_index("date")
+
+
+if __name__ == "__main__":
+    # 터미널에서 python -m src.mfiv 로 실행하면 전체 기간 MFIV를 계산해 저장한다
+    root = Path(__file__).resolve().parents[1]
+    options = load_options()
+    mfiv = compute_mfiv(options, load_rates())
+    out_path = root / "data" / "processed" / "mfiv_daily.parquet"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    mfiv.to_parquet(out_path)
+    print(mfiv.describe())
+    print(f"저장 완료: {out_path} ({len(mfiv)}일)")
