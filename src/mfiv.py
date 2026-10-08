@@ -1,5 +1,6 @@
 """MFIV 1단계: SPY 옵션 EOD 데이터 불러오기·정리"""
 from pathlib import Path
+import numpy as np
 import pandas as pd
 
 RAW_DIR = Path(__file__).resolve().parents[1] / "data" / "raw" / "options"
@@ -38,3 +39,89 @@ def load_options(years=None, raw_dir: Path = RAW_DIR) -> pd.DataFrame:
     df["c_mid"] = (df["c_bid"] + df["c_ask"]) / 2
     df["p_mid"] = (df["p_bid"] + df["p_ask"]) / 2
     return df.sort_values(["quote_date", "expire_date", "strike"]).reset_index(drop=True)
+def select_expiries(df: pd.DataFrame, target_days: int = 30, min_days: int = 7) -> pd.DataFrame:
+    """날짜마다 MFIV 계산에 쓸 만기 2개(near, next)를 고른다.
+
+    - min_days 이하 만기는 가격이 불안정하므로 제외
+    - near: target_days 이하 중 가장 긴 만기
+    - next: target_days 초과 중 가장 짧은 만기
+    - target_days 이하 만기가 없으면 target_days 초과 만기 2개를 쓰고
+      extrapolated=True로 표시 (보간 대신 외삽)
+    """
+    exp = (df[["quote_date", "expire_date", "dte"]]
+           .drop_duplicates()
+           .query("dte > @min_days")
+           .sort_values(["quote_date", "dte"]))
+
+    rows = []
+    for date, g in exp.groupby("quote_date"):
+        below = g[g["dte"] <= target_days]
+        above = g[g["dte"] > target_days]
+        if len(below) > 0 and len(above) > 0:
+            near, nxt, extra = below.iloc[-1], above.iloc[0], False
+        elif len(above) >= 2:
+            near, nxt, extra = above.iloc[0], above.iloc[1], True
+        else:
+            continue  # 쓸 수 있는 만기가 부족한 날은 건너뜀
+        rows.append({"quote_date": date,
+                     "near_exp": near["expire_date"], "near_dte": near["dte"],
+                     "next_exp": nxt["expire_date"], "next_dte": nxt["dte"],
+                     "extrapolated": extra})
+    return pd.DataFrame(rows)
+def load_rates(path=None) -> pd.Series:
+    """FRED DTB3(3개월 국채, %) CSV -> 날짜별 연이자율(소수) 시리즈"""
+    if path is None:
+        path = Path(__file__).resolve().parents[1] / "data" / "raw" / "DTB3.csv"
+    r = pd.read_csv(path)
+    r.columns = ["date", "rate"]                       # FRED 컬럼명이 달라도 대응
+    r["date"] = pd.to_datetime(r["date"])
+    r["rate"] = pd.to_numeric(r["rate"], errors="coerce") / 100   # '.'(결측) -> NaN
+    return r.set_index("date")["rate"].ffill()          # 휴일 결측은 직전 값으로 채움
+
+
+def compute_forward(chain: pd.DataFrame, r: float, T: float):
+    """한 날짜·한 만기의 옵션 체인으로 선도가격 F와 K0를 구한다.
+
+    chain: 같은 quote_date, 같은 expire_date의 행들
+    r: 연이자율 (소수), T: 만기까지 기간 (년)
+    """
+    both = chain[(chain["c_bid"] > 0) & (chain["p_bid"] > 0)]    # 콜·풋 모두 호가가 있는 행사가
+    if both.empty:
+        return float("nan"), float("nan")
+    i = (both["c_mid"] - both["p_mid"]).abs().idxmin()           # 콜·풋 차이가 가장 작은 행사가
+    k_star = both.loc[i, "strike"]
+    F = k_star + np.exp(r * T) * (both.loc[i, "c_mid"] - both.loc[i, "p_mid"])   # 풋-콜 패리티
+    below = chain.loc[chain["strike"] <= F, "strike"]
+    K0 = below.max() if not below.empty else float("nan")       # F 바로 아래 행사가
+    return F, K0
+def _walk_otm(strikes, bids, mids):
+    """K0에서 바깥쪽으로 이동하며 OTM 옵션을 모은다 (bid 0 연속 2개면 중단)."""
+    out, zeros = [], 0
+    for k, b, m in zip(strikes, bids, mids):
+        if b <= 0:
+            zeros += 1
+            if zeros == 2:
+                break
+            continue                      # bid 0 한 개는 건너뛰고 계속
+        zeros = 0
+        out.append((k, m))
+    return out
+
+
+def select_otm(chain: pd.DataFrame, K0: float) -> pd.DataFrame:
+    """MFIV 계산에 쓸 행사가별 가격 Q(K)를 고른다.
+
+    K0 아래: OTM 풋 (K0에서 아래로), K0 위: OTM 콜 (K0에서 위로),
+    K0: 콜·풋 중간값의 평균
+    """
+    ch = chain.sort_values("strike")
+    puts = ch[ch["strike"] < K0].iloc[::-1]                 # K0에서 아래로 내려가는 순서
+    calls = ch[ch["strike"] > K0]                           # K0에서 위로 올라가는 순서
+    at = ch[ch["strike"] == K0]
+
+    rows = _walk_otm(puts["strike"], puts["p_bid"], puts["p_mid"])
+    rows += _walk_otm(calls["strike"], calls["c_bid"], calls["c_mid"])
+    if not at.empty:
+        rows.append((K0, (at["c_mid"].iloc[0] + at["p_mid"].iloc[0]) / 2))
+
+    return pd.DataFrame(rows, columns=["strike", "Q"]).sort_values("strike").reset_index(drop=True)
