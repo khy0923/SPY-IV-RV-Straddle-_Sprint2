@@ -125,3 +125,20 @@ def select_otm(chain: pd.DataFrame, K0: float) -> pd.DataFrame:
         rows.append((K0, (at["c_mid"].iloc[0] + at["p_mid"].iloc[0]) / 2))
 
     return pd.DataFrame(rows, columns=["strike", "Q"]).sort_values("strike").reset_index(drop=True)
+def expiry_variance(otm: pd.DataFrame, F: float, K0: float, r: float, T: float) -> float:
+    """한 만기의 내재분산(연율)을 VIX 산출법으로 계산한다.
+
+    σ² = (2/T) Σ ΔK/K² · e^{rT} · Q(K)  −  (1/T)(F/K0 − 1)²
+    """
+    if len(otm) < 3 or T <= 0:
+        return float("nan")
+    K = otm["strike"].to_numpy()
+    Q = otm["Q"].to_numpy()
+
+    dK = np.empty_like(K)
+    dK[1:-1] = (K[2:] - K[:-2]) / 2          # 가운데: 위아래 행사가 간격의 절반
+    dK[0] = K[1] - K[0]                      # 맨 아래 끝
+    dK[-1] = K[-1] - K[-2]                   # 맨 위 끝
+
+    total = np.sum(dK / K**2 * np.exp(r * T) * Q)
+    return (2 / T) * total - (1 / T) * (F / K0 - 1) ** 2
