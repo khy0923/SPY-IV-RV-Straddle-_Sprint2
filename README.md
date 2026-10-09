@@ -7,3 +7,4 @@ IV-RV spread straddle strategy on SPY options (ATM IV + HAR)
 - **비교·검증: MFIV** (CBOE VIX 산출법)
   - VIX 대비 상관 0.995, 평균 차이 -0.19%p (2010~2023, 3,493일)
   - 스큐 프리미엄(MFIV - ATM IV) 분석 및 강건성 확인에 사용
+  - 스큐 프리미엄 음수 23일(0.7%): 외삽과 무관. 일부(2014, 2016-09-19)는 먼 OTM 호가 문제로 MFIV가 일시적으로 낮게 계산된 것으로 추정. 메인 신호(ATM IV)에는 영향 없음
